@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Web;
@@ -7868,7 +7868,7 @@ namespace Enrollment.Controllers
                     cmd.CommandText = @"
                         SELECT ia.ID, ia.Code, ia.ShortName
                         FROM Claims c WITH(NOLOCK)
-                        JOIN Mst_IssuingAuthority ia WITH(NOLOCK) ON ia.ID = c.InsuranceCompanyID
+                        JOIN Mst_IssuingAuthority ia WITH(NOLOCK) ON ia.ID = c.IssueID
                         WHERE c.ID = @cid AND ISNULL(c.Deleted,0)=0";
                     cmd.Parameters.AddWithValue("@cid", claimId);
                     using (var rdr = cmd.ExecuteReader())
@@ -8517,25 +8517,13 @@ namespace Enrollment.Controllers
         /// <summary>
         /// Picks the best tariff file using AI. Falls back to rule-based PickBestTariffFile if AI fails.
         /// </summary>
-        // Holds a human-readable summary of the most recent tariff file
-        // selection (candidate filenames sent to ClaimAI + the selection
-        // received). Populated by PickTariffFileWithAI and appended to the
-        // GetTariffDocument response Message so it surfaces in the Spectra
-        // browser console when AI Summary is opened. Cross-check only.
-        private string _lastTariffSelectionLog = "";
-
         private System.Tuple<string, byte[]> PickTariffFileWithAI(
             System.Collections.Generic.List<System.Tuple<string, DateTime, byte[]>> candidates,
             bool isPsu, string insurerCode)
         {
-            _lastTariffSelectionLog = "";
-            if (candidates == null || candidates.Count == 0) {
-                _lastTariffSelectionLog = "Sent 0 files (no tariff candidates). insurerCode=" + (insurerCode ?? "") + " isPsu=" + isPsu;
-                return null;
-            }
+            if (candidates == null || candidates.Count == 0) return null;
             if (candidates.Count == 1)
             {
-                _lastTariffSelectionLog = "Sent 1 file: [" + candidates[0].Item1 + "] | insurerCode=" + (insurerCode ?? "") + " isPsu=" + isPsu + " -> selected: " + candidates[0].Item1 + " (only one file, no AI call)";
                 byte[] converted = EnsurePdf(candidates[0].Item1, candidates[0].Item3);
                 return converted != null ? System.Tuple.Create(candidates[0].Item1, converted) : null;
             }
@@ -8559,7 +8547,6 @@ namespace Enrollment.Controllers
                     string baseUrl = claimAiUrl; // already stripped to base URL above
 
                     var fileNames = candidates.ConvertAll(c => c.Item1);
-                    _lastTariffSelectionLog = "Sent " + fileNames.Count + " files: [" + string.Join(" | ", fileNames) + "] | insurerCode=" + (insurerCode ?? "") + " isPsu=" + isPsu;
                     TariffLog("[Tariff] AI INPUT — Calling: " + baseUrl + "/api/tariff-file-selection");
                     TariffLog("[Tariff] AI INPUT — " + fileNames.Count + " files: " + string.Join(" | ", fileNames));
                     TariffLog("[Tariff] AI INPUT — InsurerCode=" + insurerCode + " IsPSU=" + isPsu);
@@ -8583,7 +8570,6 @@ namespace Enrollment.Controllers
                             dynamic result = Newtonsoft.Json.JsonConvert.DeserializeObject(json);
                             string selectedFile = result?.selectedFile?.ToString();
 
-                            _lastTariffSelectionLog += " -> AI selected: " + (selectedFile ?? "null") + " | tier=" + (result?.priorityTier?.ToString() ?? "") + " | reason=" + (result?.reason?.ToString() ?? "");
                             TariffLog("[Tariff] AI OUTPUT — Selected: " + selectedFile + " | Tier: " + result?.priorityTier + " | Reason: " + result?.reason);
 
                             if (!string.IsNullOrWhiteSpace(selectedFile))
@@ -8601,16 +8587,12 @@ namespace Enrollment.Controllers
             }
             catch (Exception ex)
             {
-                _lastTariffSelectionLog += " -> AI call FAILED: " + ex.GetType().Name + ": " + ex.Message;
                 TariffLog("[Tariff] AI CALL FAILED — " + ex.GetType().Name + ": " + ex.Message);
             }
 
             // Fallback: use existing rule-based logic
-            _lastTariffSelectionLog += " -> FALLBACK: rule-based selection used";
             TariffLog("[Tariff] FALLBACK — AI failed, using rule-based PickBestTariffFile");
-            var fb = PickBestTariffFile(candidates, isPsu, insurerCode);
-            _lastTariffSelectionLog += " -> fallback selected: " + (fb?.Item1 ?? "null");
-            return fb;
+            return PickBestTariffFile(candidates, isPsu, insurerCode);
         }
 
         /// <summary>
@@ -9182,8 +9164,7 @@ namespace Enrollment.Controllers
                     }
 
                     res.Success = true;
-                    res.Message = "Tariff loaded from zip. IsPSU=" + isPsu + " InsurerCode=" + insurerCode
-                                + " || TARIFF SELECTION: " + _lastTariffSelectionLog;
+                    res.Message = "Tariff loaded from zip. IsPSU=" + isPsu + " InsurerCode=" + insurerCode;
                     res.Data    = new { fileName = tarFileName ?? (cId + "-tariff.pdf"), base64Content = Convert.ToBase64String(tariffBytes) };
                     var sl2 = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
                     return Content(sl2.Serialize(res), "application/json");
@@ -9376,8 +9357,7 @@ namespace Enrollment.Controllers
                 byte[] bestTariff = bestTariffResult?.Item2;
                 string bestTariffName = bestTariffResult?.Item1 ?? (providerId + "-tariff.pdf");
                 res.Success = true;
-                res.Message = "Tariff loaded from S3. IsPSU=" + isPsu + " InsurerCode=" + insurerCode + " Files=" + s3TariffCandidates.Count
-                            + " || TARIFF SELECTION: " + _lastTariffSelectionLog;
+                res.Message = "Tariff loaded from S3. IsPSU=" + isPsu + " InsurerCode=" + insurerCode + " Files=" + s3TariffCandidates.Count;
                 res.Data    = new { fileName = bestTariffName, base64Content = Convert.ToBase64String(bestTariff) };
                 var s3 = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
                 return Content(s3.Serialize(res), "application/json");
