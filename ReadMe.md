@@ -1,1 +1,7 @@
-<img width="919" height="379" alt="image" src="https://github.com/user-attachments/assets/975c4467-91cc-40ad-871a-e6ba09c49567" />
+These fields should be non-editable: Patient Name, Hospital Name, Patient Age, Gender, Policy No. and Availed Accommodation
+
+Remove 'Invoice for Surgical' from Document Checklist and reduce the font size
+
+Change shade for UCR menu
+
+Increase font size of Patient Summary and decrease it for Demographics
