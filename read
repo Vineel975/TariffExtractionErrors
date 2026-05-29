@@ -1,6 +1,5 @@
--- 1. What insurer-related columns does Claims actually have?
-SELECT COLUMN_NAME
-FROM INFORMATION_SCHEMA.COLUMNS
-WHERE TABLE_NAME = 'Claims'
-  AND (COLUMN_NAME LIKE '%Issue%' OR COLUMN_NAME LIKE '%Insur%' OR COLUMN_NAME LIKE '%Payer%')
-ORDER BY COLUMN_NAME;
+-- Replace <CLAIM_ID> with the Claims.ID for the Lotus claim from your test
+SELECT c.ID, c.IssueID, ia.ID AS InsurerID, ia.Code, ia.ShortName
+FROM Claims c WITH(NOLOCK)
+JOIN Mst_IssuingAuthority ia WITH(NOLOCK) ON ia.ID = c.IssueID
+WHERE c.ID = <CLAIM_ID> AND ISNULL(c.Deleted,0) = 0;
