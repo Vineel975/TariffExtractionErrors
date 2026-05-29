@@ -7887,6 +7887,75 @@ namespace Enrollment.Controllers
         }
 
         /// <summary>
+        /// Recursively walks a zip stream and collects every leaf tariff file
+        /// (.pdf/.xlsx/.xls) as (displayName, lastModified, bytes).
+        ///
+        /// The displayName carries the FULL CHAIN of containing inner-zip names
+        /// (with the ".zip" extension stripped), joined by "_", so the AI can
+        /// see which zip a file came from. The OUTERMOST zip (the root
+        /// "tariff.zip") is NOT part of the prefix — only inner zips are.
+        ///
+        /// Examples (root = tariff.zip):
+        ///   tariff.zip/file.pdf                  -> "file.pdf"
+        ///   tariff.zip/gipsa.zip/file.pdf        -> "gipsa_file.pdf"
+        ///   tariff.zip/gipsa.zip/2024.zip/f.pdf  -> "gipsa_2024_f.pdf"
+        ///
+        /// prefix: cumulative prefix for the current zip level ("" at root).
+        /// </summary>
+        private void CollectTariffFilesFromZip(
+            System.IO.Stream zipStream,
+            string prefix,
+            System.Collections.Generic.List<System.Tuple<string, DateTime, byte[]>> sink)
+        {
+            using (var zip = new System.IO.Compression.ZipArchive(zipStream, System.IO.Compression.ZipArchiveMode.Read, true))
+            {
+                foreach (var entry in zip.Entries)
+                {
+                    if (string.IsNullOrEmpty(entry.Name)) continue; // skip folder entries
+                    var nameLow = entry.Name.ToLower();
+
+                    if (nameLow.EndsWith(".zip"))
+                    {
+                        // Nested zip: extend the prefix with this zip's name
+                        // (without ".zip") and recurse.
+                        string innerBaseName = entry.Name.Substring(0, entry.Name.Length - 4); // strip ".zip"
+                        string childPrefix = string.IsNullOrEmpty(prefix)
+                            ? innerBaseName
+                            : prefix + "_" + innerBaseName;
+                        try
+                        {
+                            using (var entryStream = entry.Open())
+                            using (var ms = new System.IO.MemoryStream())
+                            {
+                                entryStream.CopyTo(ms);
+                                ms.Position = 0;
+                                CollectTariffFilesFromZip(ms, childPrefix, sink);
+                            }
+                        }
+                        catch (Exception zEx)
+                        {
+                            TariffLog("[Tariff] Failed to open nested zip " + entry.Name + ": " + zEx.Message);
+                        }
+                    }
+                    else if (nameLow.EndsWith(".pdf") ||
+                             nameLow.EndsWith(".xlsx") ||
+                             nameLow.EndsWith(".xls"))
+                    {
+                        string displayName = string.IsNullOrEmpty(prefix)
+                            ? entry.Name
+                            : prefix + "_" + entry.Name;
+                        using (var stream = entry.Open())
+                        using (var ms = new System.IO.MemoryStream())
+                        {
+                            stream.CopyTo(ms);
+                            sink.Add(System.Tuple.Create(displayName, entry.LastWriteTime.DateTime, ms.ToArray()));
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
         /// Picks the best tariff file from a list of (filename, lastModified, bytes) entries
         /// using PSU/Private priority rules with extended fallbacks.
         /// Priority:
@@ -8517,13 +8586,25 @@ namespace Enrollment.Controllers
         /// <summary>
         /// Picks the best tariff file using AI. Falls back to rule-based PickBestTariffFile if AI fails.
         /// </summary>
+        // Holds a human-readable summary of the most recent tariff file
+        // selection (candidate filenames sent to ClaimAI + the selection
+        // received). Populated by PickTariffFileWithAI and appended to the
+        // GetTariffDocument response Message so it surfaces in the Spectra
+        // browser console when AI Summary is opened. Cross-check only.
+        private string _lastTariffSelectionLog = "";
+
         private System.Tuple<string, byte[]> PickTariffFileWithAI(
             System.Collections.Generic.List<System.Tuple<string, DateTime, byte[]>> candidates,
             bool isPsu, string insurerCode)
         {
-            if (candidates == null || candidates.Count == 0) return null;
+            _lastTariffSelectionLog = "";
+            if (candidates == null || candidates.Count == 0) {
+                _lastTariffSelectionLog = "Sent 0 files (no tariff candidates). insurerCode=" + (insurerCode ?? "") + " isPsu=" + isPsu;
+                return null;
+            }
             if (candidates.Count == 1)
             {
+                _lastTariffSelectionLog = "Sent 1 file: [" + candidates[0].Item1 + "] | insurerCode=" + (insurerCode ?? "") + " isPsu=" + isPsu + " -> selected: " + candidates[0].Item1 + " (only one file, no AI call)";
                 byte[] converted = EnsurePdf(candidates[0].Item1, candidates[0].Item3);
                 return converted != null ? System.Tuple.Create(candidates[0].Item1, converted) : null;
             }
@@ -8547,6 +8628,7 @@ namespace Enrollment.Controllers
                     string baseUrl = claimAiUrl; // already stripped to base URL above
 
                     var fileNames = candidates.ConvertAll(c => c.Item1);
+                    _lastTariffSelectionLog = "Sent " + fileNames.Count + " files: [" + string.Join(" | ", fileNames) + "] | insurerCode=" + (insurerCode ?? "") + " isPsu=" + isPsu;
                     TariffLog("[Tariff] AI INPUT — Calling: " + baseUrl + "/api/tariff-file-selection");
                     TariffLog("[Tariff] AI INPUT — " + fileNames.Count + " files: " + string.Join(" | ", fileNames));
                     TariffLog("[Tariff] AI INPUT — InsurerCode=" + insurerCode + " IsPSU=" + isPsu);
@@ -8570,6 +8652,7 @@ namespace Enrollment.Controllers
                             dynamic result = Newtonsoft.Json.JsonConvert.DeserializeObject(json);
                             string selectedFile = result?.selectedFile?.ToString();
 
+                            _lastTariffSelectionLog += " -> AI selected: " + (selectedFile ?? "null") + " | tier=" + (result?.priorityTier?.ToString() ?? "") + " | reason=" + (result?.reason?.ToString() ?? "");
                             TariffLog("[Tariff] AI OUTPUT — Selected: " + selectedFile + " | Tier: " + result?.priorityTier + " | Reason: " + result?.reason);
 
                             if (!string.IsNullOrWhiteSpace(selectedFile))
@@ -8588,11 +8671,15 @@ namespace Enrollment.Controllers
             catch (Exception ex)
             {
                 TariffLog("[Tariff] AI CALL FAILED — " + ex.GetType().Name + ": " + ex.Message);
+                _lastTariffSelectionLog += " -> AI call FAILED: " + ex.GetType().Name + ": " + ex.Message;
             }
 
             // Fallback: use existing rule-based logic
+            _lastTariffSelectionLog += " -> FALLBACK: rule-based selection used";
             TariffLog("[Tariff] FALLBACK — AI failed, using rule-based PickBestTariffFile");
-            return PickBestTariffFile(candidates, isPsu, insurerCode);
+            var fb = PickBestTariffFile(candidates, isPsu, insurerCode);
+            _lastTariffSelectionLog += " -> fallback selected: " + (fb?.Item1 ?? "null");
+            return fb;
         }
 
         /// <summary>
@@ -9049,108 +9136,31 @@ namespace Enrollment.Controllers
                         return Json(res, JsonRequestBehavior.AllowGet);
                     }
 
-                    // Step 1: Find best inner zip by rules
-                    var innerZipCandidates = new System.Collections.Generic.List<System.Tuple<string, DateTime, byte[]>>();
-                    var pdfCandidates      = new System.Collections.Generic.List<System.Tuple<string, DateTime, byte[]>>();
-
-                    using (var outerZip = System.IO.Compression.ZipFile.OpenRead(zipPath))
+                    // Recursively collect ALL tariff files from the zip — at any
+                    // nesting depth. Files inside inner zips carry the full chain
+                    // of inner-zip names as a prefix (".zip" stripped, joined by
+                    // "_"); the outer root zip is NOT part of the prefix.
+                    //   tariff.zip/file.pdf                 -> "file.pdf"
+                    //   tariff.zip/gipsa.zip/file.pdf       -> "gipsa_file.pdf"
+                    //   tariff.zip/gipsa.zip/2024.zip/f.pdf -> "gipsa_2024_f.pdf"
+                    var allTariffCandidates = new System.Collections.Generic.List<System.Tuple<string, DateTime, byte[]>>();
+                    using (var rootStream = System.IO.File.OpenRead(zipPath))
                     {
-                        foreach (var entry in outerZip.Entries)
-                        {
-                            if (string.IsNullOrEmpty(entry.Name)) continue; // skip folder entries
-                            string entryName = entry.Name;
-                            DateTime lastMod = entry.LastWriteTime.DateTime;
-                            var nameLow = entryName.ToLower();
-
-                            if (nameLow.EndsWith(".zip"))
-                            {
-                                using (var stream = entry.Open())
-                                using (var ms = new System.IO.MemoryStream())
-                                {
-                                    stream.CopyTo(ms);
-                                    innerZipCandidates.Add(System.Tuple.Create(entryName, lastMod, ms.ToArray()));
-                                }
-                            }
-                            else if (nameLow.EndsWith(".pdf") ||
-                                     nameLow.EndsWith(".xlsx") ||
-                                     nameLow.EndsWith(".xls"))
-                            {
-                                // Include PDF and Excel files as tariff candidates
-                                using (var stream = entry.Open())
-                                using (var ms = new System.IO.MemoryStream())
-                                {
-                                    stream.CopyTo(ms);
-                                    pdfCandidates.Add(System.Tuple.Create(entryName, lastMod, ms.ToArray()));
-                                }
-                            }
-                        }
+                        CollectTariffFilesFromZip(rootStream, "", allTariffCandidates);
                     }
 
                     byte[] tariffBytes = null;
 
-                    TariffLog("[Tariff] STEP 1 — Outer zip scanned. InnerZips=" + innerZipCandidates.Count + " DirectPDFs=" + pdfCandidates.Count);
+                    TariffLog("[Tariff] STEP 1 — Zip scanned recursively. Total tariff files=" + allTariffCandidates.Count);
                     TariffLog("[Tariff] STEP 1 — InsurerCode=" + insurerCode + " IsPSU=" + isPsu + " ClaimID=" + cId);
 
-                    if (innerZipCandidates.Count > 0)
+                    if (allTariffCandidates.Count > 0)
                     {
-                        TariffLog("[Tariff] STEP 2 — Inner zip names: " + string.Join(" | ", innerZipCandidates.ConvertAll(z => z.Item1)));
+                        TariffLog("[Tariff] STEP 2 — All candidate file names collected (" + allTariffCandidates.Count + "): " + string.Join(" | ", allTariffCandidates.ConvertAll(f => f.Item1 + " [" + f.Item2.ToString("yyyy-MM-dd") + "]")));
 
-                        // Collect all PDF candidates from all inner zips
-                        var allInnerPdfCandidates = new System.Collections.Generic.List<System.Tuple<string, DateTime, byte[]>>();
-                        foreach (var zipCandidate in innerZipCandidates)
-                        {
-                            TariffLog("[Tariff] STEP 2a — Opening inner zip: " + zipCandidate.Item1);
-                            try
-                            {
-                                using (var innerMs = new System.IO.MemoryStream(zipCandidate.Item3))
-                                using (var innerZip = new System.IO.Compression.ZipArchive(innerMs, System.IO.Compression.ZipArchiveMode.Read))
-                                {
-                                    foreach (var entry in innerZip.Entries)
-                                    {
-                                        if (string.IsNullOrEmpty(entry.Name)) continue;
-                                        var innerNameLow = entry.Name.ToLower();
-                                        if (!innerNameLow.EndsWith(".pdf") &&
-                                            !innerNameLow.EndsWith(".xlsx") &&
-                                            !innerNameLow.EndsWith(".xls")) continue;
-                                        using (var stream = entry.Open())
-                                        using (var ms2 = new System.IO.MemoryStream())
-                                        {
-                                            stream.CopyTo(ms2);
-                                            allInnerPdfCandidates.Add(System.Tuple.Create(entry.Name, entry.LastWriteTime.DateTime, ms2.ToArray()));
-                                            TariffLog("[Tariff] STEP 2b — Extracted from inner zip: " + entry.Name + " | LastModified=" + entry.LastWriteTime.DateTime.ToString("yyyy-MM-dd"));
-                                        }
-                                    }
-                                }
-                            }
-                            catch (Exception zEx)
-                            {
-                                TariffLog("[Tariff] STEP 2c — Failed to open inner zip " + zipCandidate.Item1 + ": " + zEx.Message);
-                            }
-                        }
-
-                        // Also include top-level PDF candidates
-                        if (pdfCandidates.Count > 0)
-                        {
-                            TariffLog("[Tariff] STEP 2d — Also including top-level PDFs: " + string.Join(" | ", pdfCandidates.ConvertAll(p => p.Item1)));
-                            allInnerPdfCandidates.AddRange(pdfCandidates);
-                        }
-
-                        TariffLog("[Tariff] STEP 3 — All candidate file names collected (" + allInnerPdfCandidates.Count + "): " + string.Join(" | ", allInnerPdfCandidates.ConvertAll(f => f.Item1 + " [" + f.Item2.ToString("yyyy-MM-dd") + "]")));
-
-                        // Use AI to pick best file
-                        TariffLog("[Tariff] STEP 4 — Sending to AI for selection...");
-                        var aiPicked = PickTariffFileWithAI(allInnerPdfCandidates, isPsu, insurerCode);
-                        tariffBytes = aiPicked?.Item2;
-                        tarFileName = aiPicked?.Item1 ?? tarFileName;
-                        TariffLog("[Tariff] STEP 5 — AI selected: " + (tarFileName ?? "null"));
-                    }
-                    else if (pdfCandidates.Count > 0)
-                    {
-                        TariffLog("[Tariff] STEP 2 — No inner zips. Direct PDF candidates (" + pdfCandidates.Count + "): " + string.Join(" | ", pdfCandidates.ConvertAll(f => f.Item1 + " [" + f.Item2.ToString("yyyy-MM-dd") + "]")));
-
-                        // No inner zips — use AI to pick best PDF directly
+                        // Use AI to pick best file (names now carry the inner-zip prefix chain)
                         TariffLog("[Tariff] STEP 3 — Sending to AI for selection...");
-                        var aiPicked = PickTariffFileWithAI(pdfCandidates, isPsu, insurerCode);
+                        var aiPicked = PickTariffFileWithAI(allTariffCandidates, isPsu, insurerCode);
                         tariffBytes = aiPicked?.Item2;
                         tarFileName = aiPicked?.Item1 ?? tarFileName;
                         TariffLog("[Tariff] STEP 4 — AI selected: " + (tarFileName ?? "null"));
@@ -9164,7 +9174,8 @@ namespace Enrollment.Controllers
                     }
 
                     res.Success = true;
-                    res.Message = "Tariff loaded from zip. IsPSU=" + isPsu + " InsurerCode=" + insurerCode;
+                    res.Message = "Tariff loaded from zip. IsPSU=" + isPsu + " InsurerCode=" + insurerCode
+                                + " || TARIFF SELECTION: " + _lastTariffSelectionLog;
                     res.Data    = new { fileName = tarFileName ?? (cId + "-tariff.pdf"), base64Content = Convert.ToBase64String(tariffBytes) };
                     var sl2 = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
                     return Content(sl2.Serialize(res), "application/json");
@@ -9357,7 +9368,8 @@ namespace Enrollment.Controllers
                 byte[] bestTariff = bestTariffResult?.Item2;
                 string bestTariffName = bestTariffResult?.Item1 ?? (providerId + "-tariff.pdf");
                 res.Success = true;
-                res.Message = "Tariff loaded from S3. IsPSU=" + isPsu + " InsurerCode=" + insurerCode + " Files=" + s3TariffCandidates.Count;
+                res.Message = "Tariff loaded from S3. IsPSU=" + isPsu + " InsurerCode=" + insurerCode + " Files=" + s3TariffCandidates.Count
+                            + " || TARIFF SELECTION: " + _lastTariffSelectionLog;
                 res.Data    = new { fileName = bestTariffName, base64Content = Convert.ToBase64String(bestTariff) };
                 var s3 = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
                 return Content(s3.Serialize(res), "application/json");
